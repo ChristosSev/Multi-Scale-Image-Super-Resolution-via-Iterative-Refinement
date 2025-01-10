@@ -3,6 +3,7 @@ from transformers import AutoTokenizer, AutoModel
 import numpy as np
 from typing import List, Union
 import logging
+from text_preprocess import *
 
 class PatientRecordEmbedder:
     """
