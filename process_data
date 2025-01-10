@@ -1,0 +1,254 @@
+import pandas as pd
+import json
+from pathlib import Path
+from typing import List, Dict, Union, Generator
+import logging
+import csv
+from datetime import datetime
+import re
+from tqdm import tqdm
+import concurrent.futures
+from dataclasses import dataclass
+import hashlib
+
+@dataclass
+class PatientRecord:
+    """Data class for structured patient records"""
+    record_id: str
+    text: str
+    timestamp: datetime = None
+    metadata: Dict = None
+    category: str = None
+
+class MedicalDataProcessor:
+    """
+    Handles loading, preprocessing, and batching of medical record data from various sources.
+    """
+    
+    def __init__(self, cache_dir: str = "./cache"):
+        """
+        Initialize the data processor.
+        
+        Args:
+            cache_dir: Directory for caching processed data
+        """
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+    def _generate_cache_key(self, data: Union[str, List[str]]) -> str:
+        """Generate a unique cache key for the input data."""
+        if isinstance(data, list):
+            data = ''.join(data)
+        return hashlib.md5(data.encode()).hexdigest()
+    
+    def load_from_csv(self, 
+                     file_path: str,
+                     text_column: str,
+                     id_column: str = None,
+                     timestamp_column: str = None,
+                     category_column: str = None) -> List[PatientRecord]:
+        """
+        Load patient records from a CSV file.
+        
+        Args:
+            file_path: Path to the CSV file
+            text_column: Name of the column containing record text
+            id_column: Name of the column containing record IDs
+            timestamp_column: Name of the column containing timestamps
+            category_column: Name of the column containing record categories
+        
+        Returns:
+            List of PatientRecord objects
+        """
+        df = pd.read_csv(file_path)
+        records = []
+        
+        for _, row in df.iterrows():
+            record_id = row[id_column] if id_column else str(len(records))
+            timestamp = pd.to_datetime(row[timestamp_column]) if timestamp_column else None
+            category = row[category_column] if category_column else None
+            
+            record = PatientRecord(
+                record_id=str(record_id),
+                text=str(row[text_column]),
+                timestamp=timestamp,
+                category=category,
+                metadata={col: row[col] for col in df.columns if col not in 
+                         [id_column, text_column, timestamp_column, category_column]}
+            )
+            records.append(record)
+            
+        self.logger.info(f"Loaded {len(records)} records from {file_path}")
+        return records
+    
+    def load_from_json(self, file_path: str) -> List[PatientRecord]:
+        """
+        Load patient records from a JSON file.
+        
+        Args:
+            file_path: Path to the JSON file
+        
+        Returns:
+            List of PatientRecord objects
+        """
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            
+        records = []
+        for item in data:
+            record = PatientRecord(
+                record_id=str(item.get('id', len(records))),
+                text=item['text'],
+                timestamp=datetime.fromisoformat(item['timestamp']) if 'timestamp' in item else None,
+                category=item.get('category'),
+                metadata={k: v for k, v in item.items() if k not in ['id', 'text', 'timestamp', 'category']}
+            )
+            records.append(record)
+            
+        self.logger.info(f"Loaded {len(records)} records from {file_path}")
+        return records
+    
+    def batch_generator(self, 
+                       records: List[PatientRecord],
+                       batch_size: int = 32,
+                       shuffle: bool = True) -> Generator[List[PatientRecord], None, None]:
+        """
+        Generate batches of records.
+        
+        Args:
+            records: List of PatientRecord objects
+            batch_size: Size of each batch
+            shuffle: Whether to shuffle the records
+        
+        Yields:
+            Batches of PatientRecord objects
+        """
+        indices = list(range(len(records)))
+        if shuffle:
+            import random
+            random.shuffle(indices)
+            
+        for i in range(0, len(indices), batch_size):
+            batch_indices = indices[i:i + batch_size]
+            yield [records[idx] for idx in batch_indices]
+    
+    def filter_records(self,
+                      records: List[PatientRecord],
+                      start_date: datetime = None,
+                      end_date: datetime = None,
+                      categories: List[str] = None) -> List[PatientRecord]:
+        """
+        Filter records based on various criteria.
+        
+        Args:
+            records: List of PatientRecord objects
+            start_date: Filter records after this date
+            end_date: Filter records before this date
+            categories: Filter records by these categories
+        
+        Returns:
+            Filtered list of PatientRecord objects
+        """
+        filtered = records
+        
+        if start_date:
+            filtered = [r for r in filtered if r.timestamp and r.timestamp >= start_date]
+            
+        if end_date:
+            filtered = [r for r in filtered if r.timestamp and r.timestamp <= end_date]
+            
+        if categories:
+            filtered = [r for r in filtered if r.category in categories]
+            
+        self.logger.info(f"Filtered {len(records)} records to {len(filtered)} records")
+        return filtered
+    
+    def export_to_csv(self,
+                     records: List[PatientRecord],
+                     output_path: str,
+                     include_metadata: bool = True) -> None:
+        """
+        Export records to a CSV file.
+        
+        Args:
+            records: List of PatientRecord objects
+            output_path: Path to save the CSV file
+            include_metadata: Whether to include metadata columns
+        """
+        rows = []
+        headers = ['record_id', 'text', 'timestamp', 'category']
+        
+        if include_metadata and any(r.metadata for r in records):
+            metadata_keys = set()
+            for record in records:
+                if record.metadata:
+                    metadata_keys.update(record.metadata.keys())
+            headers.extend(sorted(metadata_keys))
+            
+        for record in records:
+            row = {
+                'record_id': record.record_id,
+                'text': record.text,
+                'timestamp': record.timestamp.isoformat() if record.timestamp else None,
+                'category': record.category
+            }
+            
+            if include_metadata and record.metadata:
+                row.update(record.metadata)
+                
+            rows.append(row)
+            
+        df = pd.DataFrame(rows)
+        df.to_csv(output_path, index=False)
+        self.logger.info(f"Exported {len(records)} records to {output_path}")
+
+def main():
+    """Example usage of the MedicalDataProcessor"""
+    # Initialize processor
+    processor = MedicalDataProcessor()
+    
+    # Create sample data
+    sample_data = [
+        {
+            "id": "1",
+            "text": "Patient presents with fever and cough",
+            "timestamp": "2024-01-01T10:00:00",
+            "category": "Initial Visit",
+            "department": "Internal Medicine"
+        },
+        {
+            "id": "2",
+            "text": "Follow-up visit for respiratory symptoms",
+            "timestamp": "2024-01-15T14:30:00",
+            "category": "Follow-up",
+            "department": "Pulmonology"
+        }
+    ]
+    
+    # Save sample data to JSON
+    with open("sample_records.json", "w") as f:
+        json.dump(sample_data, f)
+    
+    # Load records
+    records = processor.load_from_json("sample_records.json")
+    
+    # Filter records
+    filtered_records = processor.filter_records(
+        records,
+        start_date=datetime(2024, 1, 1),
+        categories=["Initial Visit"]
+    )
+    
+    # Export filtered records
+    processor.export_to_csv(filtered_records, "filtered_records.csv")
+    
+    # Generate batches
+    for batch in processor.batch_generator(records, batch_size=1):
+        print(f"Processing batch with {len(batch)} records")
+        for record in batch:
+            print(f"Record ID: {record.record_id}, Category: {record.category}")
+
+if __name__ == "__main__":
+    main()
